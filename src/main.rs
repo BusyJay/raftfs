@@ -1,29 +1,39 @@
+#![cfg_attr(feature = "unstable", feature(test))]
+
+#[cfg(feature = "unstable")]
+extern crate test;
+extern crate crossbeam;
 extern crate crossbeam_channel;
 extern crate futures;
 extern crate raft;
 extern crate spin;
 extern crate futures_timer;
 extern crate futures_cpupool;
+extern crate protobuf;
+
+mod mpsc;
+
+use mpsc::{Sender, Receiver};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::prelude::*;
-use futures::task::AtomicTask;
 use raft::{Config, RawNode};
 use raft::storage::MemStorage;
-use raft::eraftpb::{Message, EntryType};
+use raft::eraftpb::{Message, EntryType, ConfChange, ConfChangeType};
 use spin::Mutex;
+use futures::prelude::*;
 use futures_timer::Delay;
 use futures_cpupool::CpuPool;
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     Full,
+    Disconnected,
     NotLeader(u64),
 }
 
-type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 type ProposeCallback = Box<Fn(Result<()>) + Send>;
 
 enum Msg {
@@ -35,79 +45,7 @@ enum Msg {
     Raft(Message),
 }
 
-struct Sender<T> {
-    sender: crossbeam_channel::Sender<T>,
-    task: Arc<AtomicTask>,
-    limit: usize,
-}
 
-impl<T> Sender<T> {
-    fn send(&self, msg: T) -> Result<()> {
-        let len = self.sender.len();
-        if len < self.limit {
-            // There is a race, but it's OK. It's a soft constraint.
-            self.sender.send(msg);
-            self.task.notify();
-            Ok(())
-        } else {
-            Err(Error::Full)
-        }
-    }
-
-    fn force_send(&self, msg: T) {
-        self.sender.send(msg);
-        self.task.notify();
-    }
-}
-
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Sender<T> {
-        Sender {
-            sender: self.sender.clone(),
-            task: self.task.clone(),
-            limit: self.limit.clone(),
-        }
-    }
-}
-
-struct Receiver<T> {
-    receiver: crossbeam_channel::Receiver<T>,
-    task: Arc<AtomicTask>,
-}
-
-impl<T> Receiver<T> {
-    /// Retrive an element. If `None` is returned, the current future
-    /// is guranteed to be notified when there are new messages enqueue.
-    /// 
-    /// ### Panic
-    /// 
-    /// This function will panic if no current future is being polled.
-    fn recv(&self) -> Option<T> {
-        let msg = self.receiver.try_recv();
-        if msg.is_some() {
-            return msg;
-        }
-
-        self.task.register();
-
-        // In case there is new message enqueue after setting task.
-        self.receiver.try_recv()
-    }
-}
-
-/// A special channel used only for mpsc cases.
-fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let task = Arc::new(AtomicTask::default());
-    let (sender, receiver) = crossbeam_channel::unbounded();
-    (Sender {
-        sender,
-        task: task.clone(),
-        limit: capacity,
-    }, Receiver {
-        receiver,
-        task,
-    })
-}
 
 #[derive(Clone, Default)]
 struct MessageRouter {
@@ -119,13 +57,21 @@ impl MessageRouter {
         self.route.lock().insert(id, sender);
     }
 
+    fn deregister(&self, id: u64) {
+        self.route.lock().remove(&id);
+    }
+
+    fn ping(&self, id: u64) -> bool {
+        self.route.lock().contains_key(&id)
+    }
+
     fn send(&self, msg: Message) {
         let to = msg.get_to();
         self.send_command(to, Msg::Raft(msg));
     }
 
     fn send_command(&self, to: u64, msg: Msg) {
-        if let Some(s) = self.route.lock().get(&to) {
+        if let Some(s) = self.route.lock().get_mut(&to) {
             let _ = s.send(msg);
         }
     }
@@ -171,7 +117,7 @@ impl Peer {
             ..Default::default()
         };
         let node = RawNode::new(&cfg, storage, vec![]).unwrap();
-        let (sender, receiver) = channel(100);
+        let (sender, receiver) = mpsc::channel(100);
         router.register(id, sender.clone());
         Peer { node, sender, receiver, base_tick, pool, router, cbs: HashMap::new() }
     }
@@ -179,7 +125,7 @@ impl Peer {
 
 impl Peer {
     fn schedule_base_tick(&self) {
-        let sender = self.sender.clone();
+        let mut sender = self.sender.clone();
         self.pool.spawn(Delay::new(self.base_tick.clone()).map(move |_| {
             sender.force_send(Msg::Tick)
         })).forget()
@@ -277,6 +223,17 @@ impl Peer {
                     if let Some(cb) = self.cbs.remove(entry.get_data().get(0).unwrap()) {
                         cb(Ok(()));
                     }
+                } else {
+                    let cc: ConfChange = protobuf::parse_from_bytes(entry.get_data()).unwrap();
+                    match cc.get_change_type() {
+                        ConfChangeType::AddNode => {}
+                        ConfChangeType::RemoveNode => {
+                            if cc.get_node_id() == self.node.raft.id {
+                                // self.destroy();
+                            }
+                        }
+                        ConfChangeType::AddLearnerNode => {}
+                    }
                 }
 
                 // TODO: handle EntryConfChange
@@ -295,6 +252,7 @@ impl Future for Peer {
     fn poll(&mut self) -> Poll<(), Error> {
         let mut msgs = Vec::with_capacity(1024);
         let mut has_ready = false;
+        // Potential hungry problem.
         loop {
             for _ in 0..1024 {
                 msgs.push(match self.receiver.recv() {
@@ -302,6 +260,7 @@ impl Future for Peer {
                     None => break,
                 });
             }
+            // TODO: Handle ready for every loop, but write to rocksdb at the end.
             if !msgs.is_empty() {
                 has_ready = self.handle_msgs(msgs.drain(..)) || has_ready;
             } else {
