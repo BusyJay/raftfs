@@ -16,6 +16,8 @@ mod mpsc;
 use mpsc::{Sender, Receiver};
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 use raft::{Config, RawNode};
@@ -28,8 +30,7 @@ use futures_cpupool::CpuPool;
 
 #[derive(Debug)]
 pub enum Error {
-    Full,
-    Disconnected,
+    Channel,
     NotLeader(u64),
 }
 
@@ -41,38 +42,83 @@ enum Msg {
         id: u8,
         cb: ProposeCallback,
     },
+    AddPeer {
+        id: u64,
+        cb: ProposeCallback,
+    },
     Tick,
     Raft(Message),
 }
 
 
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MessageRouter {
-    route: Arc<Mutex<HashMap<u64, Sender<Msg>>>>,
+    // store id -> channel
+    // net_route: Arc<Mutex<HashMap<u64, Sender<Msg>>>>,
+    // region id -> channel
+    ch_route: Arc<Mutex<HashMap<u64, Sender<Msg>>>>,
+    // TODO: this can be optimized as thread local variables.
+    // More particularly, as a per poll pool thread cache.
+    // net_cache: HashMap<u64, Sender<Msg>>,
+    ch_cache: HashMap<u64, Sender<Msg>>,
+    pool: CpuPool,
+    phantom: PhantomData<::std::sync::mpsc::Sender<()>>,
 }
 
 impl MessageRouter {
-    fn register(&self, id: u64, sender: Sender<Msg>) {
-        self.route.lock().insert(id, sender);
+    pub fn new(pool: CpuPool) -> MessageRouter {
+        MessageRouter {
+            ch_route: Arc::new(Mutex::new(HashMap::default())),
+            ch_cache: HashMap::default(),
+            pool,
+            phantom: PhantomData,
+        }
     }
 
-    fn deregister(&self, id: u64) {
-        self.route.lock().remove(&id);
+    fn get_or_create_ch(&mut self, id: u64) -> Option<Sender<Msg>> {
+        if let Some(ch) = self.ch_cache.get(&id) {
+            return Some(ch.clone());
+        }
+
+        let peer = {
+            let mut router = self.ch_route.lock();
+            let v = match router.entry(id) {
+                Entry::Occupied(e) => {
+                    self.ch_cache.insert(id, e.get().clone());
+                    return Some(e.get().clone())
+                },
+                Entry::Vacant(v) => v,
+            };
+            // TODO: check range, tombstone.
+            let mut peer = Peer::new(id, vec![1, 2, 3], Duration::from_millis(200), self.pool.clone(), self.clone());
+            v.insert(peer.sender.clone());
+            peer
+        };
+        let sender = peer.sender.clone();
+        self.ch_cache.insert(id, sender.clone());
+        peer.start();
+        self.pool.spawn(peer).forget();
+        Some(sender)
     }
 
-    fn ping(&self, id: u64) -> bool {
-        self.route.lock().contains_key(&id)
-    }
-
-    fn send(&self, msg: Message) {
+    fn send(&mut self, msg: Message) -> Result<()> {
         let to = msg.get_to();
-        self.send_command(to, Msg::Raft(msg));
+        self.send_command(to, Msg::Raft(msg))
     }
 
-    fn send_command(&self, to: u64, msg: Msg) {
-        if let Some(s) = self.route.lock().get_mut(&to) {
-            let _ = s.send(msg);
+    fn send_command(&mut self, to: u64, mut msg: Msg) -> Result<()> {
+        if let Some(h) = self.ch_cache.get_mut(&to) {
+            match h.send(msg) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::Error::Disconnected(m)) => msg = m,
+                _ => return Err(Error::Channel),
+            }
+        }
+        self.ch_cache.remove(&to);
+        if let Some(mut s) = self.get_or_create_ch(to) {
+            s.send(msg).map_err(|_| Error::Channel)
+        } else {
+            Err(Error::Channel)
         }
     }
 }
@@ -84,6 +130,7 @@ struct Peer {
     base_tick: Duration,
     pool: CpuPool,
     cbs: HashMap<u8, ProposeCallback>,
+    cc_cb: Option<ProposeCallback>,
     router: MessageRouter,
 }
 
@@ -118,8 +165,7 @@ impl Peer {
         };
         let node = RawNode::new(&cfg, storage, vec![]).unwrap();
         let (sender, receiver) = mpsc::channel(100);
-        router.register(id, sender.clone());
-        Peer { node, sender, receiver, base_tick, pool, router, cbs: HashMap::new() }
+        Peer { node, sender, receiver, base_tick, pool, router, cbs: HashMap::new(), cc_cb: None }
     }
 }
 
@@ -154,6 +200,20 @@ impl Peer {
 
                     cb(Err(Error::NotLeader(self.node.raft.leader_id)));
                 },
+                Msg::AddPeer { id, cb } => {
+                    if self.node.raft.leader_id == self.node.raft.id {
+                        assert!(self.cc_cb.is_none());
+                        let mut cc = ConfChange::new();
+                        cc.set_change_type(ConfChangeType::AddNode);
+                        cc.set_node_id(id);
+                        self.node.propose_conf_change(vec![], cc).unwrap();
+                        has_ready = true;
+                        self.cc_cb = Some(cb);
+                        continue;
+                    }
+
+                    cb(Err(Error::NotLeader(self.node.raft.leader_id)));
+                }
                 Msg::Raft(m) => {
                     self.node.step(m).unwrap();
                     has_ready = true;
@@ -176,7 +236,7 @@ impl Peer {
             // If the peer is leader, the leader can send messages to other followers ASAP.
             let msgs = ready.messages.drain(..);
             for msg in msgs {
-                self.router.send(msg)
+                self.router.send(msg);
             }
         }
 
@@ -203,7 +263,7 @@ impl Peer {
             // the leader after appending Raft entries.
             let msgs = ready.messages.drain(..);
             for msg in msgs {
-                self.router.send(msg)
+                self.router.send(msg);
             }
         }
 
@@ -226,7 +286,12 @@ impl Peer {
                 } else {
                     let cc: ConfChange = protobuf::parse_from_bytes(entry.get_data()).unwrap();
                     match cc.get_change_type() {
-                        ConfChangeType::AddNode => {}
+                        ConfChangeType::AddNode => {
+                            self.node.apply_conf_change(&cc);
+                            if let Some(cb) = self.cc_cb.take() {
+                                cb(Ok(()))
+                            }
+                        }
                         ConfChangeType::RemoveNode => {
                             if cc.get_node_id() == self.node.raft.id {
                                 // self.destroy();
@@ -274,15 +339,13 @@ impl Future for Peer {
 }
 
 fn main() {
-    let router = MessageRouter::default();
     let pool = CpuPool::new(2);
-    for id in 1..4 {
-        let mut peer = Peer::new(id, vec![1, 2, 3], Duration::from_millis(200), pool.clone(), router.clone());
-        peer.start();
-        pool.spawn(peer).forget();
-    }
+    let mut router = MessageRouter::new(pool.clone());
+    let peer = Peer::new(1, vec![1], Duration::from_millis(200), pool.clone(), router.clone());
+    peer.start();
+    pool.spawn(peer).forget();
+    
     use std::thread;
-    thread::sleep(Duration::from_secs(20));
     let (tx, rx) = crossbeam_channel::bounded(1);
     let mut leader = 1;
     loop {
@@ -303,5 +366,31 @@ fn main() {
             None => {},
         }
         thread::sleep(Duration::from_millis(100));
+    }
+    for id in 2..4 {
+        loop {
+            let tx = tx.clone();
+            router.send_command(leader, Msg::AddPeer { id, cb: Box::new(move |res| tx.send(res.map(|_| ""))) });
+            match rx.recv() {
+                Some(Err(Error::NotLeader(id))) => {
+                    if id != 0 {
+                        println!("Leader is elected as {}", id);
+                        leader = id;
+                    }
+                }
+                Some(Err(e)) => panic!("unexpected error: {:?}", e),
+                Some(Ok(s)) => {
+                    println!("node {} is added.", id);
+                    break;
+                },
+                None => panic!("receiver is dropped silently"),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    router.send_command(3, Msg::Propose { id: 3, cb: Box::new(move |res| tx.send(res.map(|_| "should failed")))});
+    match rx.recv() {
+        Some(Err(Error::NotLeader(_))) => println!("node 3 is working."),
+        res => panic!("unexpected result: {:?}", res),
     }
 }

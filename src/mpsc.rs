@@ -1,39 +1,55 @@
+use std::result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel;
 use futures::prelude::*;
 use futures::task::AtomicTask;
 
-use super::{Error, Result};
+pub enum Error<T> {
+    Full(T),
+    Disconnected(T),
+}
+
+type Result<T, M> = result::Result<T, Error<M>>;
+
+struct State {
+    task: AtomicTask,
+    closed: AtomicBool,
+}
 
 pub struct Sender<T> {
     sender: crossbeam_channel::Sender<T>,
-    task: Arc<AtomicTask>,
+    state: Arc<State>,
     try_point: usize,
     limit: usize,
 }
 
 impl<T> Sender<T> {
-    pub fn send(&mut self, msg: T) -> Result<()> {
-        if self.try_point < self.limit {
-        } else {
-            let len = self.sender.len();
-            if len < self.limit {
-                self.try_point = 0;
+    pub fn send(&mut self, msg: T) -> Result<(), T> {
+        if !self.state.closed.load(Ordering::Acquire) {
+            if self.try_point < self.limit {
             } else {
-                return Err(Error::Full);
+                let len = self.sender.len();
+                if len < self.limit {
+                    self.try_point = 0;
+                } else {
+                    return Err(Error::Full(msg));
+                }
             }
+            self.try_point += 1;
+            self.sender.send(msg);
+            self.state.task.notify();
+            Ok(())
+        } else {
+            Err(Error::Disconnected(msg))
         }
-        self.try_point += 1;
-        self.sender.send(msg);
-        self.task.notify();
-        Ok(())
     }
 
     pub fn force_send(&mut self, msg: T) {
         self.try_point += 1;
         self.sender.send(msg);
-        self.task.notify();
+        self.state.task.notify();
     }
 }
 
@@ -42,7 +58,7 @@ impl<T> Clone for Sender<T> {
         Sender {
             sender: self.sender.clone(),
             try_point: 0,
-            task: self.task.clone(),
+            state: self.state.clone(),
             limit: self.limit.clone(),
         }
     }
@@ -50,7 +66,7 @@ impl<T> Clone for Sender<T> {
 
 pub struct Receiver<T> {
     receiver: crossbeam_channel::Receiver<T>,
-    task: Arc<AtomicTask>,
+    state: Arc<State>,
 }
 
 impl<T> Receiver<T> {
@@ -66,7 +82,7 @@ impl<T> Receiver<T> {
             return msg;
         }
 
-        self.task.register();
+        self.state.task.register();
 
         // In case there is new message enqueue after setting task.
         self.receiver.try_recv()
@@ -75,9 +91,9 @@ impl<T> Receiver<T> {
 
 impl<T> Stream for Receiver<T> {
     type Item = T;
-    type Error = Error;
+    type Error = Error<T>;
 
-    fn poll(&mut self) -> Poll<Option<T>, Error> {
+    fn poll(&mut self) -> Poll<Option<T>, Error<T>> {
         match self.recv() {
             Some(i) => Ok(Async::Ready(Some(i))),
             None => Ok(Async::NotReady),
@@ -85,18 +101,27 @@ impl<T> Stream for Receiver<T> {
     }
 }
 
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+    }
+}
+
 /// A special channel used only for mpsc cases.
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let task = Arc::new(AtomicTask::default());
+    let state = Arc::new(State {
+        task: AtomicTask::default(),
+        closed: AtomicBool::new(false),
+    });
     let (sender, receiver) = crossbeam_channel::unbounded();
     (Sender {
         sender,
         try_point: 0,
-        task: task.clone(),
+        state: state.clone(),
         limit: capacity,
     }, Receiver {
         receiver,
-        task,
+        state,
     })
 }
 
@@ -134,9 +159,9 @@ mod bench_channel {
         let mut i = 0;
         b.iter(|| {
             i += 1;
-            tx.send(i).unwrap();
+            tx.send(i);
         });
-        tx.send(0).unwrap();
+        tx.send(0);
         let ts = t.join().unwrap();
         assert_eq!(ts, i);
     }
